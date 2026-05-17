@@ -52,3 +52,7 @@ coverage/
 # Temporary files
 tmp/
 temp/
+
+# Generated analysis reports
+reports/
+http_objects_*/
