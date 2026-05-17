@@ -110,10 +110,11 @@ function parseIcmpPayloadsFromHex(hexOutput) {
 
 async function extractRawIcmpPayloads(pcapPath, filter) {
   const tsharkPath = await findTshark();
-  const filterFlag = filter ? ` -Y "${filter}"` : '';
+  const icmpFilter = filter || 'icmp';
+  const filterFlag = ` -Y "${icmpFilter}"`;
   const { stdout } = await execAsync(
     `${tsharkPath} -r "${pcapPath}"${filterFlag} -x`,
-    { env: { ...process.env, PATH: `${process.env.PATH}:/usr/bin:/usr/local/bin:/opt/homebrew/bin` } }
+    { maxBuffer: 50 * 1024 * 1024, env: { ...process.env, PATH: `${process.env.PATH}:/usr/bin:/usr/local/bin:/opt/homebrew/bin` } }
   );
   return parseIcmpPayloadsFromHex(stdout);
 }
