@@ -1283,6 +1283,71 @@ server.prompt(
   })
 );
 
+server.tool(
+  'get_endpoint_stats',
+  'List all unique IP endpoints with packet counts, traffic direction, and protocol breakdown from a PCAP file',
+  {
+    pcapPath: z.string().describe('Path to the PCAP file to analyze'),
+    filter: z.string().optional().describe('Display filter to scope endpoint analysis'),
+  },
+  async (args) => {
+    try {
+      const tsharkPath = await findTshark();
+      const { pcapPath, filter } = args;
+      await fs.access(pcapPath);
+      const filterFlag = filter ? ` -Y "${filter}"` : '';
+      const { stdout: ipsStdout } = await execAsync(
+        `${tsharkPath} -r "${pcapPath}"${filterFlag} -T fields -e ip.src -e ip.dst -e _ws.col.Protocol`,
+        { maxBuffer: 50 * 1024 * 1024, env: { ...process.env, PATH: `${process.env.PATH}:/usr/bin:/usr/local/bin:/opt/homebrew/bin` } }
+      );
+      const lines = ipsStdout.trim().split('\n').filter(l => l.trim());
+      const ipStats = {};
+      for (const line of lines) {
+        const [src, dst, proto] = line.split('\t');
+        if (src && !ipStats[src]) ipStats[src] = { asSrc: 0, asDst: 0, protocols: new Set() };
+        if (dst && !ipStats[dst]) ipStats[dst] = { asSrc: 0, asDst: 0, protocols: new Set() };
+        if (src) { ipStats[src].asSrc++; if (proto) ipStats[src].protocols.add(proto); }
+        if (dst) { ipStats[dst].asDst++; if (proto) ipStats[dst].protocols.add(proto); }
+      }
+      const sorted = Object.entries(ipStats).sort((a, b) => (b[1].asSrc + b[1].asDst) - (a[1].asSrc + a[1].asDst));
+      let output = `Endpoint Statistics for: ${pcapPath}\n\n`;
+      output += `${'IP'.padEnd(17)} ${'Src Pkts'.padStart(9)} ${'Dst Pkts'.padStart(9)} ${'Total'.padStart(8)}  Protocol Mix\n`;
+      output += `${'─'.repeat(17)} ${'─'.repeat(9)} ${'─'.repeat(9)} ${'─'.repeat(8)}  ${'─'.repeat(20)}\n`;
+      for (const [ip, stats] of sorted) {
+        const total = stats.asSrc + stats.asDst;
+        output += `${ip.padEnd(17)} ${String(stats.asSrc).padStart(9)} ${String(stats.asDst).padStart(9)} ${String(total).padStart(8)}  ${[...stats.protocols].slice(0, 5).join(', ')}\n`;
+      }
+      output += `\nTotal unique IPs: ${sorted.length}\n`;
+      return {
+        content: [{ type: 'text', text: output }],
+      };
+    } catch (error) {
+      console.error(`Error in get_endpoint_stats: ${error.message}`);
+      return { content: [{ type: 'text', text: `Error: ${error.message}` }], isError: true };
+    }
+  }
+);
+
+server.prompt(
+  'get_endpoint_stats_prompt',
+  {
+    pcapPath: z.string().describe('Path to the PCAP file'),
+  },
+  ({ pcapPath }) => ({
+    messages: [{
+      role: 'user',
+      content: {
+        type: 'text',
+        text: `Please analyze the endpoint statistics from ${pcapPath} and identify:
+1. Most active hosts and their roles
+2. Unusual communication patterns between endpoints
+3. Potential beaconing or C2 traffic indicators
+4. Hosts that warrant deeper investigation`
+      }
+    }]
+  })
+);
+
 module.exports = {
   findTshark, trimPackets, parseTsharkJson,
   parseIcmpPayloadsFromHex, extractRawIcmpPayloads
