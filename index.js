@@ -906,6 +906,78 @@ server.prompt(
   })
 );
 
+server.tool(
+  'extract_http_objects',
+  'Extract HTTP objects (files, images, scripts, documents) from a PCAP file and compute SHA256 hashes for malware analysis',
+  {
+    pcapPath: z.string().describe('Path to the PCAP file to analyze'),
+    filter: z.string().optional().describe('Display filter to narrow extraction scope'),
+  },
+  async (args) => {
+    try {
+      const tsharkPath = await findTshark();
+      const { pcapPath, filter } = args;
+      await fs.access(pcapPath);
+      const filterFlag = filter ? ` -Y "${filter}"` : '';
+      const tmpDir = `http_objects_${Date.now()}`;
+      await fs.mkdir(tmpDir, { recursive: true });
+      try {
+        await execAsync(
+          `${tsharkPath} -r "${pcapPath}"${filterFlag} --export-objects "http,${tmpDir}"`,
+          { maxBuffer: 50 * 1024 * 1024, env: { ...process.env, PATH: `${process.env.PATH}:/usr/bin:/usr/local/bin:/opt/homebrew/bin` } }
+        );
+      } catch (e) {
+        if (!e.message.includes('export-objects')) throw e;
+      }
+      const files = await fs.readdir(tmpDir).catch(() => []);
+      const fileInfos = [];
+      for (const file of files) {
+        const filePath = path.join(tmpDir, file);
+        try {
+          const stat = await fs.stat(filePath);
+          const content = await fs.readFile(filePath);
+          const hash = crypto.createHash('sha256').update(content).digest('hex');
+          fileInfos.push({ filename: file, size: stat.size, sha256: hash });
+        } catch (e) {
+          console.error(`Failed to process extracted file ${file}: ${e.message}`);
+        }
+      }
+      for (const file of files) {
+        await fs.unlink(path.join(tmpDir, file)).catch(() => {});
+      }
+      await fs.rmdir(tmpDir).catch(() => {});
+      return {
+        content: [{
+          type: 'text',
+          text: `HTTP Objects extracted from: ${pcapPath}\n\n${fileInfos.length > 0 ? fileInfos.map(f => `  ${f.filename}\n    Size: ${f.size} bytes\n    SHA256: ${f.sha256}`).join('\n\n') : 'No HTTP objects found to extract.'}`,
+        }],
+      };
+    } catch (error) {
+      console.error(`Error in extract_http_objects: ${error.message}`);
+      return { content: [{ type: 'text', text: `Error: ${error.message}` }], isError: true };
+    }
+  }
+);
+
+server.prompt(
+  'extract_http_objects_prompt',
+  {
+    pcapPath: z.string().describe('Path to the PCAP file'),
+  },
+  ({ pcapPath }) => ({
+    messages: [{
+      role: 'user',
+      content: {
+        type: 'text',
+        text: `Please analyze the HTTP objects extracted from ${pcapPath}:
+1. Identify any suspicious files (executables, scripts, archives)
+2. Check SHA256 hashes against known malware databases
+3. Assess the risk level of downloaded content`
+      }
+    }]
+  })
+);
+
 module.exports = {
   findTshark, trimPackets, parseTsharkJson,
   parseIcmpPayloadsFromHex, extractRawIcmpPayloads
