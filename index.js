@@ -804,6 +804,53 @@ server.prompt(
   })
 );
 
+server.tool(
+  'follow_tcp_stream',
+  'Follow a TCP stream from a PCAP file and return the reconstructed conversation for protocol analysis',
+  {
+    pcapPath: z.string().describe('Path to the PCAP file to analyze'),
+    stream: z.number().int().min(0).describe('TCP stream index to follow (e.g., 0, 1, 2...)'),
+    mode: z.enum(['ascii', 'hex', 'raw']).optional().default('ascii').describe('Output mode: ascii readable text, hex dump, or raw binary'),
+  },
+  async (args) => {
+    try {
+      const tsharkPath = await findTshark();
+      const { pcapPath, stream, mode } = args;
+      await fs.access(pcapPath);
+      const { stdout } = await execAsync(
+        `${tsharkPath} -r "${pcapPath}" -q -z "follow,tcp,${mode},${stream}"`,
+        { maxBuffer: 50 * 1024 * 1024, env: { ...process.env, PATH: `${process.env.PATH}:/usr/bin:/usr/local/bin:/opt/homebrew/bin` } }
+      );
+      return {
+        content: [{ type: 'text', text: `TCP Stream ${stream} (${mode} mode):\n\n${stdout}` }],
+      };
+    } catch (error) {
+      console.error(`Error in follow_tcp_stream: ${error.message}`);
+      return { content: [{ type: 'text', text: `Error: ${error.message}` }], isError: true };
+    }
+  }
+);
+
+server.prompt(
+  'follow_tcp_stream_prompt',
+  {
+    pcapPath: z.string().describe('Path to the PCAP file'),
+    stream: z.number().describe('TCP stream index to follow'),
+  },
+  ({ pcapPath, stream = 0 }) => ({
+    messages: [{
+      role: 'user',
+      content: {
+        type: 'text',
+        text: `Please analyze TCP stream ${stream} from ${pcapPath} and describe:
+1. The protocol and application-layer conversation
+2. Any notable data transfers or commands
+3. Security implications of the communication`
+      }
+    }]
+  })
+);
+
 module.exports = {
   findTshark, trimPackets, parseTsharkJson,
   parseIcmpPayloadsFromHex, extractRawIcmpPayloads
