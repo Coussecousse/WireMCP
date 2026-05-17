@@ -851,6 +851,61 @@ server.prompt(
   })
 );
 
+server.tool(
+  'get_expert_info',
+  'Extract expert information (errors, warnings, notes, malformed packets, chats) from a PCAP file for anomaly detection',
+  {
+    pcapPath: z.string().describe('Path to the PCAP file to analyze'),
+    filter: z.string().optional().describe('Display filter to narrow scope (e.g., "http" or "tcp.port==80")'),
+  },
+  async (args) => {
+    try {
+      const tsharkPath = await findTshark();
+      const { pcapPath, filter } = args;
+      await fs.access(pcapPath);
+      const filterFlag = filter ? ` -Y "${filter}"` : '';
+      const { stdout } = await execAsync(
+        `${tsharkPath} -r "${pcapPath}"${filterFlag} -z expert`,
+        { maxBuffer: 10 * 1024 * 1024, env: { ...process.env, PATH: `${process.env.PATH}:/usr/bin:/usr/local/bin:/opt/homebrew/bin` } }
+      );
+      const severityCounts = {};
+      for (const line of stdout.split('\n')) {
+        const match = line.match(/^\s*(Error|Warning|Note|Chat)\s+/i);
+        if (match) severityCounts[match[1]] = (severityCounts[match[1]] || 0) + 1;
+      }
+      const summary = Object.entries(severityCounts).map(([k, v]) => `  ${k}: ${v}`).join('\n');
+      return {
+        content: [{
+          type: 'text',
+          text: `Expert Info for: ${pcapPath}\n\nSummary:\n${summary || '  None'}\n\nDetails:\n${stdout}`,
+        }],
+      };
+    } catch (error) {
+      console.error(`Error in get_expert_info: ${error.message}`);
+      return { content: [{ type: 'text', text: `Error: ${error.message}` }], isError: true };
+    }
+  }
+);
+
+server.prompt(
+  'get_expert_info_prompt',
+  {
+    pcapPath: z.string().describe('Path to the PCAP file'),
+  },
+  ({ pcapPath }) => ({
+    messages: [{
+      role: 'user',
+      content: {
+        type: 'text',
+        text: `Please analyze the expert info from ${pcapPath} and highlight:
+1. Errors and malformed packets that indicate issues
+2. Warnings that suggest potential security events
+3. Overall network health assessment`
+      }
+    }]
+  })
+);
+
 module.exports = {
   findTshark, trimPackets, parseTsharkJson,
   parseIcmpPayloadsFromHex, extractRawIcmpPayloads
