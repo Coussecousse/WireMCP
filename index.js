@@ -1131,6 +1131,78 @@ server.prompt(
   })
 );
 
+server.tool(
+  'search_payloads',
+  'Search for patterns (strings, hex) in TCP packet payloads from a PCAP file, useful for finding exfiltrated data or C2 commands',
+  {
+    pcapPath: z.string().describe('Path to the PCAP file to analyze'),
+    pattern: z.string().describe('Pattern to search for in packet payloads (case-insensitive string match)'),
+    filter: z.string().optional().describe('Display filter to narrow search scope (e.g., "http" or "ip.addr==1.2.3.4")'),
+    context: z.number().int().min(0).max(50).optional().default(0).describe('Number of surrounding packets to include as context'),
+    maxResults: z.number().int().min(1).max(100).optional().default(20).describe('Maximum number of matching frames to return'),
+  },
+  async (args) => {
+    try {
+      const tsharkPath = await findTshark();
+      const { pcapPath, pattern, filter, context, maxResults } = args;
+      await fs.access(pcapPath);
+      const filterPrefix = filter ? `${filter} and ` : '';
+      const { stdout } = await execAsync(
+        `${tsharkPath} -r "${pcapPath}" -Y "${filterPrefix}tcp contains "${pattern}"" -T fields -e frame.number -e frame.time -e ip.src -e ip.dst -e tcp.srcport -e tcp.dstport -e _ws.col.Protocol`,
+        { maxBuffer: 50 * 1024 * 1024, env: { ...process.env, PATH: `${process.env.PATH}:/usr/bin:/usr/local/bin:/opt/homebrew/bin` } }
+      );
+      const lines = stdout.trim().split('\n').filter(l => l.trim());
+      let output = `Search results for "${pattern}" in: ${pcapPath}\n\n`;
+      if (lines.length === 0) {
+        output += 'No matches found.';
+      } else {
+        output += `Found ${lines.length} matching packet(s). Showing first ${Math.min(lines.length, maxResults)}:\n\n`;
+        const matchFrames = lines.map(l => l.split('\t')[0]).filter(Boolean);
+        for (let i = 0; i < Math.min(matchFrames.length, maxResults); i++) {
+          output += `Frame ${matchFrames[i]}: ${lines[i]}\n`;
+          if (context > 0) {
+            const startFrame = Math.max(1, parseInt(matchFrames[i]) - context);
+            const endFrame = parseInt(matchFrames[i]) + context;
+            const { stdout: hexOut } = await execAsync(
+              `${tsharkPath} -r "${pcapPath}" -Y "frame.number >= ${startFrame} && frame.number <= ${endFrame}" -T fields -e frame.number -e ip.src -e ip.dst -e _ws.col.Protocol`,
+              { maxBuffer: 10 * 1024 * 1024, env: { ...process.env, PATH: `${process.env.PATH}:/usr/bin:/usr/local/bin:/opt/homebrew/bin` } }
+            );
+            output += `  Context (${context} before/after):\n${hexOut.split('\n').map(l => `    ${l}`).join('\n').slice(0, 2000)}\n`;
+          }
+          output += '\n';
+        }
+        if (lines.length > maxResults) output += `... and ${lines.length - maxResults} more matches\n`;
+      }
+      return {
+        content: [{ type: 'text', text: output }],
+      };
+    } catch (error) {
+      console.error(`Error in search_payloads: ${error.message}`);
+      return { content: [{ type: 'text', text: `Error: ${error.message}` }], isError: true };
+    }
+  }
+);
+
+server.prompt(
+  'search_payloads_prompt',
+  {
+    pcapPath: z.string().describe('Path to the PCAP file'),
+    pattern: z.string().describe('Pattern to search for'),
+  },
+  ({ pcapPath, pattern }) => ({
+    messages: [{
+      role: 'user',
+      content: {
+        type: 'text',
+        text: `Please analyze the search results for pattern "${pattern}" in ${pcapPath}:
+1. Identify context and significance of each match
+2. Correlate matches with other network events
+3. Assess if this indicates malicious activity or data exfiltration`
+      }
+    }]
+  })
+);
+
 module.exports = {
   findTshark, trimPackets, parseTsharkJson,
   parseIcmpPayloadsFromHex, extractRawIcmpPayloads
