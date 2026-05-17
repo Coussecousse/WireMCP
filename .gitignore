@@ -56,3 +56,10 @@ temp/
 # Generated analysis reports
 reports/
 http_objects_*/
+
+# Generated backup files
+index.js.full_backup
+index.js.full_reference
+
+# Windows filesystem artifacts
+nul
