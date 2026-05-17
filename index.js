@@ -1492,12 +1492,14 @@ server.tool(
           }));
 
           const suspiciousKeywords = ['\.xyz', '\.top', '\.club', '\.download', '\.work', '\.gq', '\.ml', '\.cf', 'tk', 'ddns', 'duckdns', 'no-ip', 'servehttp', 'serveftp', 'dynamic-dns', 'redirectme'];
+          const c2Snis = ['whitepepper', 'dyngate', 'trycloudflare', 'communicationfirewall-security', 'holiday-forever', 'megafilehub', 'whooptm', 'msgas', 'datamicrosoft', 'windows-msgas', 'bellantonicioccolato', 'nemotoads', 'bluemoontuesday'];
           for (const c of tlsConnections) {
             if (c.sni) {
               const lower = c.sni.toLowerCase();
               const isSuspicious = suspiciousKeywords.some(k => lower.includes(k.replace(/^\\\./, '.')));
               const isIP = /^\d+\.\d+\.\d+\.\d+$/.test(c.sni);
-              if (isSuspicious || isIP) suspiciousSNIs.push(c);
+              const isC2 = c2Snis.some(k => lower.includes(k));
+              if (isSuspicious || isIP || isC2) suspiciousSNIs.push(c);
             }
           }
         }
@@ -1528,18 +1530,21 @@ server.tool(
         try { await fs.rmdir(tmpDir); } catch {}
       } catch {}
 
-      // ── Search for common C2 patterns ──
+      // ── Search for C2/IOC patterns ──
       let searchResults = {};
-      const commonPatterns = [
-        { pattern: 'eval', filter: 'http', label: 'HTTP eval()' },
+      const c2Patterns = [
+        { pattern: 'fakeurl.htm', filter: 'http', label: 'RAT fakeurl.htm (NetSupport)' },
+        { pattern: 'set_agent', filter: 'http', label: 'C2 agent registration' },
+        { pattern: '/api/file/get-file/', filter: 'http', label: 'C2 file download API' },
+        { pattern: '.ps1', filter: 'http', label: 'PowerShell script download' },
+        { pattern: 'foots.php', filter: 'http', label: 'C2 beacon foots.php' },
+        { pattern: '/eval/', filter: 'http', label: 'HTTP eval()' },
         { pattern: 'base64_decode', filter: 'http', label: 'base64_decode' },
-        { pattern: 'cmd', filter: 'http', label: 'HTTP cmd' },
-        { pattern: 'exec', filter: 'http', label: 'HTTP exec' },
-        { pattern: 'shell', filter: 'http', label: 'HTTP shell' },
+        { pattern: 'cmd.exe', filter: '', label: 'cmd.exe in payload' },
+        { pattern: 'powershell', filter: '', label: 'PowerShell in payload' },
         { pattern: 'passwd', filter: '', label: 'passwd in payload' },
-        { pattern: 'admin', filter: 'http', label: 'HTTP admin' },
       ];
-      for (const { pattern, filter: f, label } of commonPatterns) {
+      for (const { pattern, filter: f, label } of c2Patterns) {
         try {
           const filterPrefix = f ? `${f} and ` : '';
           const hexP = Buffer.from(pattern, 'utf8').toString('hex').replace(/(..)/g, '$1:').replace(/:$/, '');
@@ -1551,6 +1556,33 @@ server.tool(
           if (count > 0) searchResults[label] = count;
         } catch {}
       }
+      // Also detect typosquatting domains via DNS
+      try {
+        const { stdout: dnsOut } = await execAsync(
+          `${tsharkPath} -r "${pcapPath}" -Y "dns.flags.response == 0" -T fields -e dns.qry.name`,
+          { maxBuffer: 10 * 1024 * 1024, env: { ...process.env, PATH: `${process.env.PATH}:/usr/bin:/usr/local/bin:/opt/homebrew/bin` } }
+        );
+        const dnsNames = dnsOut.trim().split('\n').filter(l => l.trim());
+        const safeDomains = ['login.microsoftonline.com', 'microsoftonline.com', 'microsoft.com', 'update.microsoft.com', 'delivery.mp.microsoft.com'];
+        const susDomains = dnsNames.filter(d => {
+          const clean = d.trim().toLowerCase();
+          if (safeDomains.some(s => clean === s || clean.endsWith('.' + s))) return false;
+          return /\.su$|\.xyz$|\.top$|\.cc$|\.lat$|\.cyou$/.test(clean) ||
+            /microsoft[^.]/.test(clean) || /windows-[^.]/.test(clean) ||
+            clean.includes('whitepepper') || clean.includes('dyngate') ||
+            clean.includes('trycloudflare') || clean.includes('fakeurl') ||
+            clean.includes('netsupport') || clean.includes('nemotoads') ||
+            clean.includes('bluemoontuesday') || clean.includes('massfriction') ||
+            clean.includes('msgas') || clean.includes('easyas123') ||
+            clean.includes('datamicrosoft') || clean.includes('win11office') ||
+            clean.includes('event-time-microsoft') || clean.includes('eventdata-microsoft') ||
+            clean.includes('event-datamicrosoft');
+        });
+        if (susDomains.length > 0) {
+          const uniqueSus = [...new Set(susDomains)];
+          searchResults[`Suspicious DNS (${uniqueSus.length} domains: ${uniqueSus.slice(0, 5).map(d => d.trim()).join(', ')}${uniqueSus.length > 5 ? '...' : ''})`] = susDomains.length;
+        }
+      } catch {}
 
       // ── Try common TCP streams ──
       let interestingStreams = [];
@@ -1583,33 +1615,38 @@ server.tool(
       report += `**Tool:** WireMCP via MCP protocol\n\n`;
 
       // ── Section 1: Executive Summary ──
+      const hasCritical = Object.keys(searchResults).length > 0 || suspiciousSNIs.length > 0;
+      const status = hasCritical ? '⚠️  SUSPICIOUS ACTIVITY DETECTED' : '✅ NO CLEAR COMPROMISE';
       report += `## 1. Executive Summary\n\n`;
-      if (expertSummary) report += `**Traffic Overview:** ${expertSummary}. ${totalIPs} unique IPs identified. ${timelineSummary}.\n\n`;
-      if (suspiciousSNIs.length > 0) {
-        report += `**Suspicious TLS Connections Detected:** ${suspiciousSNIs.length} connections to potentially suspicious destinations were identified.\n\n`;
-      }
+      report += `**Status:** ${status}\n\n`;
+      if (expertSummary) report += `**Traffic Overview:** ${expertSummary}. ${totalIPs} unique IPs. ${timelineSummary}.\n\n`;
       if (Object.keys(searchResults).length > 0) {
-        report += `**Pattern Matches Found:** Suspicious strings matched in packet payloads.\n\n`;
+        report += `**🔴 CRITICAL — C2/IOC Patterns:**\n`;
+        for (const [label, count] of Object.entries(searchResults)) {
+          report += `- ${label}: ${count} hit(s)\n`;
+        }
+        report += '\n';
+      }
+      if (suspiciousSNIs.length > 0) {
+        report += `**🟡 Suspicious TLS Connections:** ${suspiciousSNIs.length} connection(s) to suspicious destinations.\n\n`;
+        for (const c of suspiciousSNIs) {
+          report += `- ${c.dst} → SNI: \`${c.sni}\`\n`;
+        }
+        report += '\n';
       }
       if (httpObjects.length > 0) {
-        report += `**HTTP Objects Extracted:** ${httpObjects.length} file(s) transferred over HTTP.\n\n`;
-      }
-      if (interestingStreams.length > 0) {
-        report += `**TCP Streams of Interest:** ${interestingStreams.length} stream(s) with significant data content.\n\n`;
+        const uniqueHashes = new Set(httpObjects.map(o => o.sha256));
+        report += `**HTTP Objects:** ${httpObjects.length} file(s) transferred (${uniqueHashes.size} unique).\n\n`;
       }
 
       // ── Section 2: Network Topology & Key Hosts ──
       report += `## 2. Network Topology & Key Hosts\n\n`;
       if (topTalkers.length > 0) {
-        report += `**Top Talkers (by packet volume):**\n\n`;
-        report += `| IP | Src Pkts | Dst Pkts | Total | Protocols |\n`;
-        report += `|----|----------|----------|-------|-----------|\n`;
-        for (const t of topTalkers) {
-          report += `| \`${t.ip}\` | ${t.src} | ${t.dst} | ${t.total} | ${t.protos} |\n`;
+        report += `**Key Hosts (top 5 by traffic):**\n\n`;
+        for (const t of topTalkers.slice(0, 5)) {
+          report += `- \`${t.ip.trim()}\`: ${t.total} pkts (${t.protos.trim()})\n`;
         }
-        report += `\nTotal unique IPs: ${totalIPs}\n\n`;
-      } else {
-        report += `No IP traffic data available.\n\n`;
+        report += `\nTotal IPs in capture: ${totalIPs}\n\n`;
       }
 
       // ── Section 3: IOCs ──
@@ -1626,14 +1663,17 @@ server.tool(
       }
 
       if (tlsConnections.length > 0 && suspiciousSNIs.length === 0) {
-        report += `### TLS Connections Overview\n\n`;
-        report += `| Destination | SNI | TLS Version |\n`;
-        report += `|-------------|-----|-------------|\n`;
-        for (const c of tlsConnections.slice(0, 15)) {
-          report += `| \`${c.dst}\` | ${c.sni || '(none)'} | ${c.version || '(unknown)'} |\n`;
+        const nonMicrosoft = tlsConnections.filter(c => c.sni && !c.sni.includes('microsoft') && !c.sni.includes('msn.com') && !c.sni.includes('bing.com') && !c.sni.includes('live.com') && !c.sni.includes('windows.com') && !c.sni.includes('office') && !c.sni.includes('skype') && !c.sni.includes('google') && !c.sni.includes('gstatic') && !c.sni.includes('azure'));
+        if (nonMicrosoft.length > 0) {
+          report += `### Non-Microsoft TLS Connections\n\n`;
+          report += `| Destination | SNI |\n`;
+          report += `|-------------|-----|\n`;
+          for (const c of nonMicrosoft.slice(0, 10)) {
+            report += `| \`${c.dst}\` | ${c.sni || '(none)'} |\n`;
+          }
+          if (nonMicrosoft.length > 10) report += `| ... and ${nonMicrosoft.length - 10} more | |\n`;
+          report += '\n';
         }
-        if (tlsConnections.length > 15) report += `| ... and ${tlsConnections.length - 15} more | | |\n`;
-        report += '\n';
       }
 
       if (Object.keys(searchResults).length > 0) {
@@ -1671,12 +1711,13 @@ server.tool(
         }
       }
 
-      if (expertAnomalies.length > 0) {
-        report += `### Protocol Anomalies (Expert Info)\n\n`;
+      const criticalAnomalies = expertAnomalies.filter(a => a.severity === 'Error' || a.severity === 'Warning');
+      if (criticalAnomalies.length > 0) {
+        report += `### Protocol Anomalies (Errors/Warnings only)\n\n`;
         report += `| Severity | Message | Occurrences |\n`;
         report += `|----------|---------|-------------|\n`;
-        for (const a of expertAnomalies) {
-          const icon = a.severity === 'Error' ? '🔴' : a.severity === 'Warning' ? '🟡' : '🔵';
+        for (const a of criticalAnomalies) {
+          const icon = a.severity === 'Error' ? '🔴' : '🟡';
           report += `| ${icon} ${a.severity} | ${a.msg.replace(/\|/g, '\\|')} | ${a.count} |\n`;
         }
         report += '\n';
