@@ -1032,6 +1032,105 @@ server.prompt(
   })
 );
 
+server.tool(
+  'get_conversation_timeline',
+  'Generate a chronological timeline of network events from a PCAP file, grouped by time windows for incident reconstruction',
+  {
+    pcapPath: z.string().describe('Path to the PCAP file to analyze'),
+    interval: z.number().positive().optional().default(60).describe('Time interval in seconds for each summary window'),
+    filter: z.string().optional().describe('Display filter to scope the timeline'),
+  },
+  async (args) => {
+    try {
+      const tsharkPath = await findTshark();
+      const { pcapPath, interval, filter } = args;
+      await fs.access(pcapPath);
+      const filterFlag = filter ? ` -Y "${filter}"` : '';
+      const { stdout } = await execAsync(
+        `${tsharkPath} -r "${pcapPath}"${filterFlag} -T json -e frame.number -e frame.time_epoch -e ip.src -e ip.dst -e _ws.col.Protocol -e frame.protocols -e tcp.srcport -e tcp.dstport -e http.request.method -e http.request.uri -e http.response.code -e dns.qry.name -e icmp.type -e tls.handshake.extensions_server_name`,
+        { maxBuffer: 50 * 1024 * 1024, env: { ...process.env, PATH: `${process.env.PATH}:/usr/bin:/usr/local/bin:/opt/homebrew/bin` } }
+      );
+      let packets;
+      try { packets = JSON.parse(stdout); } catch (e) { throw new Error(`Invalid tshark output: ${e.message}`); }
+      if (packets.length === 0) return { content: [{ type: 'text', text: 'No packets found.' }] };
+      const times = packets.map(p => parseFloat(p._source?.layers['frame.time_epoch']?.[0])).filter(t => !isNaN(t));
+      if (times.length === 0) return { content: [{ type: 'text', text: 'No timestamp data available.' }] };
+      const startTime = Math.min(...times);
+      const endTime = Math.max(...times);
+      const windows = {};
+      for (const p of packets) {
+        const t = parseFloat(p._source?.layers['frame.time_epoch']?.[0]);
+        if (isNaN(t)) continue;
+        const windowStart = Math.floor((t - startTime) / interval) * interval;
+        const key = `${windowStart}-${windowStart + interval}`;
+        if (!windows[key]) windows[key] = { start: windowStart, packets: [] };
+        windows[key].packets.push(p);
+      }
+      let timeline = `Timeline (${interval}s windows) from ${new Date(startTime * 1000).toISOString()} to ${new Date(endTime * 1000).toISOString()}\n\n`;
+      for (const [key, win] of Object.entries(windows).sort((a, b) => a[1].start - b[1].start)) {
+        const timeStr = new Date((startTime + win.start) * 1000).toISOString();
+        timeline += `[${timeStr}] Window +${win.start}s to +${win.start + interval}s (${win.packets.length} packets)\n`;
+        const protocols = {};
+        const conversations = {};
+        const dnsQueries = new Set();
+        const httpReqs = [];
+        const httpResps = [];
+        const tlsSnis = new Set();
+        const icmpTypes = new Set();
+        for (const p of win.packets) {
+          const layers = p._source?.layers;
+          const proto = layers['_ws.col.Protocol']?.[0] || layers['frame.protocols']?.[0] || 'unknown';
+          protocols[proto] = (protocols[proto] || 0) + 1;
+          const src = `${layers['ip.src']?.[0]}:${layers['tcp.srcport']?.[0] || '*'}`;
+          const dst = `${layers['ip.dst']?.[0]}:${layers['tcp.dstport']?.[0] || '*'}`;
+          if (src && dst) conversations[`${src} → ${dst}`] = (conversations[`${src} → ${dst}`] || 0) + 1;
+          if (layers['dns.qry.name']?.[0]) dnsQueries.add(layers['dns.qry.name'][0]);
+          if (layers['http.request.method']?.[0]) httpReqs.push(`${layers['http.request.method'][0]} ${layers['http.request.uri']?.[0] || ''}`);
+          if (layers['http.response.code']?.[0]) httpResps.push(`HTTP ${layers['http.response.code'][0]}`);
+          if (layers['tls.handshake.extensions_server_name']?.[0]) tlsSnis.add(layers['tls.handshake.extensions_server_name'][0]);
+          if (layers['icmp.type']?.[0]) icmpTypes.add(`type ${layers['icmp.type'][0]}`);
+        }
+        const topConvs = Object.entries(conversations).sort((a, b) => b[1] - a[1]).slice(0, 5);
+        timeline += `  Protocols: ${Object.entries(protocols).sort((a, b) => b[1] - a[1]).slice(0, 5).map(([p, c]) => `${p}(${c})`).join(', ')}\n`;
+        timeline += `  Top Conversations:\n${topConvs.map(([c, n]) => `    ${c} (${n} pkts)`).join('\n')}\n`;
+        if (dnsQueries.size > 0) timeline += `  DNS Queries: ${[...dnsQueries].slice(0, 10).join(', ')}\n`;
+        if (httpReqs.length > 0) timeline += `  HTTP Requests: ${httpReqs.slice(0, 5).join(', ')}\n`;
+        if (httpResps.length > 0) timeline += `  HTTP Responses: ${[...new Set(httpResps)].join(', ')}\n`;
+        if (tlsSnis.size > 0) timeline += `  TLS SNI: ${[...tlsSnis].join(', ')}\n`;
+        if (icmpTypes.size > 0) timeline += `  ICMP: ${[...icmpTypes].join(', ')}\n`;
+        timeline += '\n';
+      }
+      if (timeline.length > 720000) timeline = timeline.slice(0, 720000) + '\n\n[Truncated due to length...]';
+      return {
+        content: [{ type: 'text', text: timeline }],
+      };
+    } catch (error) {
+      console.error(`Error in get_conversation_timeline: ${error.message}`);
+      return { content: [{ type: 'text', text: `Error: ${error.message}` }], isError: true };
+    }
+  }
+);
+
+server.prompt(
+  'get_conversation_timeline_prompt',
+  {
+    pcapPath: z.string().describe('Path to the PCAP file'),
+  },
+  ({ pcapPath }) => ({
+    messages: [{
+      role: 'user',
+      content: {
+        type: 'text',
+        text: `Please analyze the conversation timeline from ${pcapPath} and provide:
+1. A chronological narrative of network events
+2. Key phases of activity (normal traffic vs. malicious)
+3. Timeline of C2 communication or data exfiltration
+4. Recommendations for further investigation`
+      }
+    }]
+  })
+);
+
 module.exports = {
   findTshark, trimPackets, parseTsharkJson,
   parseIcmpPayloadsFromHex, extractRawIcmpPayloads
