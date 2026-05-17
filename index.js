@@ -1203,6 +1203,86 @@ server.prompt(
   })
 );
 
+server.tool(
+  'extract_tls_metadata',
+  'Extract TLS metadata (SNI, certificate common names, TLS versions) from a PCAP file for identifying encrypted C2 channels',
+  {
+    pcapPath: z.string().describe('Path to the PCAP file to analyze'),
+    filter: z.string().optional().describe('Display filter to scope extraction (e.g., "tls")'),
+  },
+  async (args) => {
+    try {
+      const tsharkPath = await findTshark();
+      const { pcapPath, filter } = args;
+      await fs.access(pcapPath);
+      const filterFlag = filter ? ` -Y "${filter}"` : '';
+      const { stdout } = await execAsync(
+        `${tsharkPath} -r "${pcapPath}"${filterFlag} -T json -e frame.number -e frame.time -e ip.src -e ip.dst -e tcp.srcport -e tcp.dstport -e tls.handshake.extensions_server_name -e x509sat.commonName -e x509sat.organizationName -e x509sat.countryName -e tls.handshake.version`,
+        { maxBuffer: 50 * 1024 * 1024, env: { ...process.env, PATH: `${process.env.PATH}:/usr/bin:/usr/local/bin:/opt/homebrew/bin` } }
+      );
+      let packets;
+      try { packets = JSON.parse(stdout); } catch (e) { throw new Error(`Invalid tshark output: ${e.message}`); }
+      const connections = {};
+      for (const p of packets) {
+        const layers = p._source?.layers;
+        const src = `${layers['ip.src']?.[0]}:${layers['tcp.srcport']?.[0]}`;
+        const dst = `${layers['ip.dst']?.[0]}:${layers['tcp.dstport']?.[0]}`;
+        const key = `${src} → ${dst}`;
+        if (!connections[key]) connections[key] = { src, dst, sni: new Set(), certs: new Set(), orgs: new Set(), countries: new Set(), versions: new Set(), frames: [] };
+        connections[key].frames.push(layers['frame.number']?.[0]);
+        if (layers['tls.handshake.extensions_server_name']?.[0]) connections[key].sni.add(layers['tls.handshake.extensions_server_name'][0]);
+        if (layers['x509sat.commonName']?.[0]) connections[key].certs.add(layers['x509sat.commonName'][0]);
+        if (layers['x509sat.organizationName']?.[0]) connections[key].orgs.add(layers['x509sat.organizationName'][0]);
+        if (layers['x509sat.countryName']?.[0]) connections[key].countries.add(layers['x509sat.countryName'][0]);
+        if (layers['tls.handshake.version']?.[0]) connections[key].versions.add(layers['tls.handshake.version'][0]);
+      }
+      let output = `TLS Metadata for: ${pcapPath}\n\n`;
+      const connKeys = Object.keys(connections);
+      if (connKeys.length === 0) {
+        output += 'No TLS connections found.';
+      } else {
+        output += `Found ${connKeys.length} TLS connection(s):\n\n`;
+        for (const [key, conn] of Object.entries(connections)) {
+          output += `  ${conn.dst}\n`;
+          output += `    Frames: ${conn.frames[0]}–${conn.frames[conn.frames.length - 1]}\n`;
+          if (conn.sni.size > 0) output += `    SNI: ${[...conn.sni].join(', ')}\n`;
+          if (conn.certs.size > 0) output += `    Certificate CN: ${[...conn.certs].join(', ')}\n`;
+          if (conn.orgs.size > 0) output += `    Organization: ${[...conn.orgs].join(', ')}\n`;
+          if (conn.countries.size > 0) output += `    Country: ${[...conn.countries].join(', ')}\n`;
+          if (conn.versions.size > 0) output += `    TLS Versions: ${[...conn.versions].join(', ')}\n`;
+          output += '\n';
+        }
+      }
+      return {
+        content: [{ type: 'text', text: output }],
+      };
+    } catch (error) {
+      console.error(`Error in extract_tls_metadata: ${error.message}`);
+      return { content: [{ type: 'text', text: `Error: ${error.message}` }], isError: true };
+    }
+  }
+);
+
+server.prompt(
+  'extract_tls_metadata_prompt',
+  {
+    pcapPath: z.string().describe('Path to the PCAP file'),
+  },
+  ({ pcapPath }) => ({
+    messages: [{
+      role: 'user',
+      content: {
+        type: 'text',
+        text: `Please analyze the TLS metadata from ${pcapPath} and identify:
+1. Suspicious TLS connections to unusual domains
+2. Self-signed certificates or certificate anomalies
+3. Encrypted C2 channels or data exfiltration
+4. Overall TLS security posture`
+      }
+    }]
+  })
+);
+
 module.exports = {
   findTshark, trimPackets, parseTsharkJson,
   parseIcmpPayloadsFromHex, extractRawIcmpPayloads
