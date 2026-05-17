@@ -22,7 +22,7 @@ async function findTshark() {
   } catch (err) {
     console.error('which failed to find tshark:', err.message);
     const fallbacks = process.platform === 'win32'
-      ? ['C:\\Program Files\\Wireshark\\tshark.exe', 'C:\\Program Files (x86)\\Wireshark\\tshark.exe']
+      ? ['D:\\wireshark\\tshark.exe', 'C:\\Program Files\\Wireshark\\tshark.exe', 'C:\\Program Files (x86)\\Wireshark\\tshark.exe']
       : ['/usr/bin/tshark', '/usr/local/bin/tshark', '/opt/homebrew/bin/tshark', '/Applications/Wireshark.app/Contents/MacOS/tshark'];
     
     for (const path of fallbacks) {
@@ -44,18 +44,98 @@ const server = new McpServer({
   version: '1.0.0',
 });
 
+// ===== Utility Functions =====
+
+function trimPackets(packets, maxChars = 720000) {
+  let jsonString = JSON.stringify(packets);
+  if (jsonString.length > maxChars) {
+    const trimCount = Math.max(1, Math.floor(packets.length * (maxChars / jsonString.length)));
+    const trimmed = packets.slice(0, trimCount);
+    console.error(`Trimmed packets from ${packets.length} to ${trimCount} to fit ${maxChars} chars`);
+    return trimmed;
+  }
+  return packets;
+}
+
+function parseTsharkJson(stdout) {
+  try {
+    return JSON.parse(stdout);
+  } catch (err) {
+    console.error(`Failed to parse tshark JSON output: ${err.message}`);
+    console.error(`Raw output (first 500 chars): ${stdout.slice(0, 500)}`);
+    throw new Error(`Invalid tshark output: ${err.message}`);
+  }
+}
+
+const ETH_IP_ICMP_OFFSET = 14 + 20 + 8;
+
+function parseIcmpPayloadsFromHex(hexOutput) {
+  const result = {};
+  let currentFrame = null;
+  let currentBytes = [];
+
+  const lines = hexOutput.split('\n');
+  for (const line of lines) {
+    const frameMatch = line.match(/Frame (\d+):/);
+    if (frameMatch) {
+      if (currentFrame !== null && currentBytes.length > ETH_IP_ICMP_OFFSET) {
+        const payload = currentBytes.slice(ETH_IP_ICMP_OFFSET);
+        if (payload.length > 0) {
+          result[currentFrame] = Buffer.from(payload).toString('hex').toUpperCase();
+        }
+      }
+      currentFrame = parseInt(frameMatch[1]);
+      currentBytes = [];
+      continue;
+    }
+
+    const hexMatch = line.match(/^\s*[0-9a-f]{4}\s+((?:[0-9a-f]{2}\s)+)/);
+    if (hexMatch && currentFrame !== null) {
+      const hexBytes = hexMatch[1].trim().split(/\s+/).filter(b => b.length === 2);
+      for (const b of hexBytes) {
+        currentBytes.push(parseInt(b, 16));
+      }
+    }
+  }
+
+  if (currentFrame !== null && currentBytes.length > ETH_IP_ICMP_OFFSET) {
+    const payload = currentBytes.slice(ETH_IP_ICMP_OFFSET);
+    if (payload.length > 0) {
+      result[currentFrame] = Buffer.from(payload).toString('hex').toUpperCase();
+    }
+  }
+
+  return result;
+}
+
+async function extractRawIcmpPayloads(pcapPath, filter) {
+  const tsharkPath = await findTshark();
+  const filterFlag = filter ? ` -Y "${filter}"` : '';
+  const { stdout } = await execAsync(
+    `${tsharkPath} -r "${pcapPath}"${filterFlag} -x`,
+    { env: { ...process.env, PATH: `${process.env.PATH}:/usr/bin:/usr/local/bin:/opt/homebrew/bin` } }
+  );
+  return parseIcmpPayloadsFromHex(stdout);
+}
+
 // Tool 1: Capture live packet data
+const TSHARK_ICMP_FIELDS = '-e icmp.type -e icmp.code -e icmp.seq -e icmp.ident -e icmp.checksum -e data.len -e data.data';
+const TSHARK_ICMPV6_FIELDS = '-e icmpv6.type -e icmpv6.code';
+const TSHARK_META_FIELDS = '-e ip.id -e ip.ttl -e frame.time_epoch -e frame.protocols';
+const TSHARK_UDP_FIELDS = '-e udp.srcport -e udp.dstport';
+
 server.tool(
   'capture_packets',
-  'Capture live traffic and provide raw packet data as JSON for LLM analysis',
+  'Capture live traffic and provide raw packet data as JSON for LLM analysis (supports TCP, UDP, HTTP, ICMP, ICMPv6)',
   {
     interface: z.string().optional().default('en0').describe('Network interface to capture from (e.g., eth0, en0)'),
     duration: z.number().optional().default(5).describe('Capture duration in seconds'),
+    filter: z.string().optional().describe('Display filter to apply (e.g., "icmp")'),
   },
   async (args) => {
     try {
       const tsharkPath = await findTshark();
-      const { interface, duration } = args;
+      const { interface, duration, filter } = args;
       const tempPcap = 'temp_capture.pcap';
       console.error(`Capturing packets on ${interface} for ${duration}s`);
 
@@ -64,18 +144,20 @@ server.tool(
         { env: { ...process.env, PATH: `${process.env.PATH}:/usr/bin:/usr/local/bin:/opt/homebrew/bin` } }
       );
 
+      const filterFlag = filter ? ` -Y "${filter}"` : '';
       const { stdout, stderr } = await execAsync(
-        `${tsharkPath} -r "${tempPcap}" -T json -e frame.number -e ip.src -e ip.dst -e tcp.srcport -e tcp.dstport -e tcp.flags -e frame.time -e http.request.method -e http.response.code`,
+        `${tsharkPath} -r "${tempPcap}" -T json -e frame.number -e frame.time -e ip.src -e ip.dst -e tcp.srcport -e tcp.dstport -e tcp.flags ${TSHARK_UDP_FIELDS} ${TSHARK_ICMP_FIELDS} ${TSHARK_ICMPV6_FIELDS} ${TSHARK_META_FIELDS} -e http.request.method -e http.response.code${filterFlag}`,
         { env: { ...process.env, PATH: `${process.env.PATH}:/usr/bin:/usr/local/bin:/opt/homebrew/bin` } }
       );
       if (stderr) console.error(`tshark stderr: ${stderr}`);
-      let packets = JSON.parse(stdout);
+      let packets;
+      try { packets = JSON.parse(stdout); } catch (e) { throw new Error(`Failed to parse tshark output: ${e.message}`); }
 
       const maxChars = 720000;
       let jsonString = JSON.stringify(packets);
       if (jsonString.length > maxChars) {
         const trimFactor = maxChars / jsonString.length;
-        const trimCount = Math.floor(packets.length * trimFactor);
+        const trimCount = Math.max(1, Math.floor(packets.length * trimFactor));
         packets = packets.slice(0, trimCount);
         jsonString = JSON.stringify(packets);
         console.error(`Trimmed packets from ${packets.length} to ${trimCount} to fit ${maxChars} chars`);
@@ -300,26 +382,29 @@ server.tool(
 // Tool 6: Analyze an existing PCAP file for general context
 server.tool(
   'analyze_pcap',
-  'Analyze a PCAP file and provide general packet data as JSON for LLM analysis',
+  'Analyze a PCAP file and provide general packet data as JSON for LLM analysis (supports TCP, UDP, HTTP, ICMP, ICMPv6)',
   {
     pcapPath: z.string().describe('Path to the PCAP file to analyze (e.g., ./demo.pcap)'),
+    filter: z.string().optional().describe('Display filter to apply (e.g., "icmp" or "http")'),
   },
   async (args) => {
     try {
       const tsharkPath = await findTshark();
-      const { pcapPath } = args;
+      const { pcapPath, filter } = args;
       console.error(`Analyzing PCAP file: ${pcapPath}`);
 
       // Check if file exists
       await fs.access(pcapPath);
 
       // Extract broad packet data
+      const filterFlag = filter ? ` -Y "${filter}"` : '';
       const { stdout, stderr } = await execAsync(
-        `${tsharkPath} -r "${pcapPath}" -T json -e frame.number -e ip.src -e ip.dst -e tcp.srcport -e tcp.dstport -e udp.srcport -e udp.dstport -e http.host -e http.request.uri -e frame.protocols`,
+        `${tsharkPath} -r "${pcapPath}" -T json -e frame.number -e frame.time -e ip.src -e ip.dst -e tcp.srcport -e tcp.dstport ${TSHARK_UDP_FIELDS} ${TSHARK_ICMP_FIELDS} ${TSHARK_ICMPV6_FIELDS} ${TSHARK_META_FIELDS} -e http.host -e http.request.uri${filterFlag}`,
         { env: { ...process.env, PATH: `${process.env.PATH}:/usr/bin:/usr/local/bin:/opt/homebrew/bin` } }
       );
       if (stderr) console.error(`tshark stderr: ${stderr}`);
-      const packets = JSON.parse(stdout);
+      let packets;
+      try { packets = JSON.parse(stdout); } catch (e) { throw new Error(`Invalid tshark output: ${e.message}`); }
 
       const ips = [...new Set(packets.flatMap(p => [
         p._source?.layers['ip.src']?.[0],
@@ -339,8 +424,8 @@ server.tool(
       let jsonString = JSON.stringify(packets);
       if (jsonString.length > maxChars) {
         const trimFactor = maxChars / jsonString.length;
-        const trimCount = Math.floor(packets.length * trimFactor);
-        packets.splice(trimCount);
+        const trimCount = Math.max(1, Math.floor(packets.length * trimFactor));
+        packets = packets.slice(0, trimCount);
         jsonString = JSON.stringify(packets);
         console.error(`Trimmed packets from ${packets.length} to ${trimCount} to fit ${maxChars} chars`);
       }
@@ -367,24 +452,26 @@ server.tool(
     'Extract potential credentials (HTTP Basic Auth, FTP, Telnet) from a PCAP file for LLM analysis',
     {
       pcapPath: z.string().describe('Path to the PCAP file to analyze (e.g., ./demo.pcap)'),
+      filter: z.string().optional().describe('Display filter to apply (e.g., "http" or "ftp")'),
     },
     async (args) => {
       try {
         const tsharkPath = await findTshark();
-        const { pcapPath } = args;
+        const { pcapPath, filter } = args;
         console.error(`Extracting credentials from PCAP file: ${pcapPath}`);
+        const filterFlag = filter ? ` -Y "${filter}"` : '';
   
         await fs.access(pcapPath);
   
         // Extract plaintext credentials
         const { stdout: plaintextOut } = await execAsync(
-          `${tsharkPath} -r "${pcapPath}" -T fields -e http.authbasic -e ftp.request.command -e ftp.request.arg -e telnet.data -e frame.number`,
+          `${tsharkPath} -r "${pcapPath}"${filterFlag} -T fields -e http.authbasic -e ftp.request.command -e ftp.request.arg -e telnet.data -e frame.number`,
           { env: { ...process.env, PATH: `${process.env.PATH}:/usr/bin:/usr/local/bin:/opt/homebrew/bin` } }
         );
 
         // Extract Kerberos credentials
         const { stdout: kerberosOut } = await execAsync(
-          `${tsharkPath} -r "${pcapPath}" -T fields -e kerberos.CNameString -e kerberos.realm -e kerberos.cipher -e kerberos.type -e kerberos.msg_type -e frame.number`,
+          `${tsharkPath} -r "${pcapPath}"${filterFlag} -T fields -e kerberos.CNameString -e kerberos.realm -e kerberos.cipher -e kerberos.type -e kerberos.msg_type -e frame.number`,
           { env: { ...process.env, PATH: `${process.env.PATH}:/usr/bin:/usr/local/bin:/opt/homebrew/bin` } }
         );
 
@@ -508,6 +595,46 @@ server.tool(
     }
   );
 
+// Tool 8: Extract ICMP payload data from a PCAP file
+server.tool(
+  'extract_icmp_data',
+  'Extract and decode ICMP payload data from a PCAP file, useful for finding hidden data in ICMP packets',
+  {
+    pcapPath: z.string().describe('Path to the PCAP file to analyze (e.g., ./demo.pcap)'),
+    filter: z.string().optional().describe('Display filter to apply (e.g., "icmp" or "icmp.type==8")'),
+  },
+  async (args) => {
+    try {
+      const { pcapPath, filter } = args;
+      const payloads = await extractRawIcmpPayloads(pcapPath, filter);
+      const frameNumbers = Object.keys(payloads).sort((a, b) => a - b);
+
+      let outputText = `ICMP Payload Analysis for: ${pcapPath}\n\n`;
+      if (frameNumbers.length === 0) {
+        outputText += 'No ICMP payload data found.\n';
+      } else {
+        outputText += `Found ICMP payloads in ${frameNumbers.length} frame(s):\n\n`;
+        for (const frameNum of frameNumbers) {
+          const hex = payloads[frameNum];
+          const ascii = Buffer.from(hex, 'hex').toString('utf8');
+          const base64 = Buffer.from(hex, 'hex').toString('base64');
+          outputText += `Frame ${frameNum}:\n`;
+          outputText += `  Hex (${hex.length / 2} bytes): ${hex}\n`;
+          outputText += `  ASCII: ${ascii}\n`;
+          outputText += `  Base64: ${base64}\n\n`;
+        }
+      }
+
+      return {
+        content: [{ type: 'text', text: outputText }],
+      };
+    } catch (error) {
+      console.error(`Error in extract_icmp_data: ${error.message}`);
+      return { content: [{ type: 'text', text: `Error: ${error.message}` }], isError: true };
+    }
+  }
+);
+
 // Add prompts for each tool
 server.prompt(
   'capture_packets_prompt',
@@ -626,7 +753,7 @@ server.prompt(
         text: `Please analyze the PCAP file at ${pcapPath} and provide insights about:
 1. Overall traffic patterns
 2. Unique IPs and their interactions
-3. Protocols and services used
+3. Protocols and services used (including ICMP)
 4. Notable events or anomalies
 5. Potential security concerns`
       }
@@ -654,10 +781,37 @@ server.prompt(
   })
 );
 
-// Start the server
-server.connect(new StdioServerTransport())
-  .then(() => console.error('WireMCP Server is running...'))
-  .catch(err => {
-    console.error('Failed to start WireMCP:', err);
-    process.exit(1);
-  });
+server.prompt(
+  'extract_icmp_data_prompt',
+  {
+    pcapPath: z.string().describe('Path to the PCAP file'),
+  },
+  ({ pcapPath }) => ({
+    messages: [{
+      role: 'user',
+      content: {
+        type: 'text',
+        text: `Please analyze the PCAP file at ${pcapPath} for ICMP data:
+1. Extract and decode any ICMP payloads
+2. Look for hidden messages or data in ICMP packets
+3. Analyze ICMP types and codes used
+4. Check for ICMP tunneling or data exfiltration`
+      }
+    }]
+  })
+);
+
+module.exports = {
+  findTshark, trimPackets, parseTsharkJson,
+  parseIcmpPayloadsFromHex, extractRawIcmpPayloads
+};
+
+// Start the server only when run directly
+if (require.main === module) {
+  server.connect(new StdioServerTransport())
+    .then(() => console.error('WireMCP Server is running...'))
+    .catch(err => {
+      console.error('Failed to start WireMCP:', err);
+      process.exit(1);
+    });
+}

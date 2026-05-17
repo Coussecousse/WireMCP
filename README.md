@@ -14,6 +14,7 @@ WireMCP exposes the following tools to MCP clients, enhancing LLM understanding 
 - **`check_ip_threats`**: Performs targeted threat intelligence lookups for specific IP addresses against multiple threat feeds, providing detailed reputation and threat data.
 - **`analyze_pcap`**: Analyzes PCAP files to provide comprehensive packet data in JSON format, enabling detailed post-capture analysis of network traffic.
 - **`extract_credentials`**: Scans PCAP files for potential credentials from various protocols (HTTP Basic Auth, FTP, Telnet), aiding in security audits and forensic analysis.
+- **`extract_icmp_data`**: Extracts and decodes ICMP payload data with hex dump fallback for sub-dissector masked packets, enabling detection of hidden messages or covert channels via ICMP.
 
 
 ## How It Helps LLMs
