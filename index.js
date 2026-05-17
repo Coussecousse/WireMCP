@@ -978,6 +978,60 @@ server.prompt(
   })
 );
 
+server.tool(
+  'get_pcap_statistics',
+  'Get protocol hierarchy, endpoint, or conversation statistics from a PCAP file for traffic profiling',
+  {
+    pcapPath: z.string().describe('Path to the PCAP file to analyze'),
+    type: z.enum(['protocol-hierarchy', 'endpoints', 'conversations']).optional().default('protocol-hierarchy').describe('Type of statistics to compute'),
+    filter: z.string().optional().describe('Display filter to scope statistics'),
+  },
+  async (args) => {
+    try {
+      const tsharkPath = await findTshark();
+      const { pcapPath, type, filter } = args;
+      await fs.access(pcapPath);
+      const filterFlag = filter ? ` -Y "${filter}"` : '';
+      let statFlag;
+      switch (type) {
+        case 'protocol-hierarchy': statFlag = '-z io,phs'; break;
+        case 'endpoints': statFlag = '-z endpoints,ip'; break;
+        case 'conversations': statFlag = '-z conv,tcp'; break;
+      }
+      const { stdout } = await execAsync(
+        `${tsharkPath} -r "${pcapPath}"${filterFlag} -q ${statFlag}`,
+        { maxBuffer: 10 * 1024 * 1024, env: { ...process.env, PATH: `${process.env.PATH}:/usr/bin:/usr/local/bin:/opt/homebrew/bin` } }
+      );
+      return {
+        content: [{ type: 'text', text: `Statistics (${type}) for: ${pcapPath}\n\n${stdout}` }],
+      };
+    } catch (error) {
+      console.error(`Error in get_pcap_statistics: ${error.message}`);
+      return { content: [{ type: 'text', text: `Error: ${error.message}` }], isError: true };
+    }
+  }
+);
+
+server.prompt(
+  'get_pcap_statistics_prompt',
+  {
+    pcapPath: z.string().describe('Path to the PCAP file'),
+    type: z.string().optional().describe('Type of statistics'),
+  },
+  ({ pcapPath, type = 'protocol-hierarchy' }) => ({
+    messages: [{
+      role: 'user',
+      content: {
+        type: 'text',
+        text: `Please analyze the ${type} statistics from ${pcapPath} and describe:
+1. The dominant protocols and traffic patterns
+2. Any unusual protocol usage or anomalies
+3. Overall traffic profile and what it reveals about the host`
+      }
+    }]
+  })
+);
+
 module.exports = {
   findTshark, trimPackets, parseTsharkJson,
   parseIcmpPayloadsFromHex, extractRawIcmpPayloads
