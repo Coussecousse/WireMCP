@@ -17,6 +17,58 @@ WireMCP exposes the following tools to MCP clients, enhancing LLM understanding 
 - **`extract_icmp_data`**: Extracts and decodes ICMP payload data with hex dump fallback for sub-dissector masked packets, enabling detection of hidden messages or covert channels via ICMP.
 
 
+## New Tools (PCAP Forensics)
+
+In addition to the base features, WireMCP includes **8 advanced forensic tools** for deep PCAP analysis plus an **automated report generator**:
+
+- **`follow_tcp_stream`**: Reconstructs TCP conversations in ASCII, hex, or raw mode — essential for reading C2 commands, exfiltrated data, and protocol payloads.
+- **`get_expert_info`**: Extracts Wireshark expert info (errors, warnings, notes) to quickly identify malformed packets, protocol anomalies, and suspicious behavior.
+- **`extract_http_objects`**: Extracts HTTP objects (scripts, images, documents) transferred over HTTP with SHA256 hashes — useful for identifying malware downloads.
+- **`get_pcap_statistics`**: Provides protocol hierarchy and packet length statistics for traffic profiling.
+- **`get_conversation_timeline`**: Generates time-windowed conversation summaries for incident reconstruction and beaconing detection.
+- **`search_payloads`**: Searches packet payloads for ASCII strings (converted to hex internally for tshark compatibility) — ideal for finding C2 patterns, credentials, or IOCs.
+- **`extract_tls_metadata`**: Extracts TLS handshake metadata (SNI, TLS versions) for identifying encrypted C2 channels.
+- **`get_endpoint_stats`**: Lists all unique IP endpoints with packet counts, traffic direction, and protocol breakdown.
+- **`generate_incident_report`**: **NEW** — Runs all analyses automatically and generates a comprehensive structured incident report with:
+  - Executive summary
+  - Network topology & key hosts
+  - Indicators of Compromise (IOCs)
+  - **Wireshark verification steps** (display filters and procedures to reproduce each finding in Wireshark GUI)
+  - Traffic timeline
+  - Remediation recommendations
+
+### Report Structure
+
+Each incident report follows this template:
+
+```markdown
+# Incident Report — <pcap_filename>
+
+## 1. Executive Summary
+File info, traffic overview, key findings summary
+
+## 2. Network Topology & Key Hosts
+Top talkers table (IP, packet counts, protocols)
+
+## 3. Indicators of Compromise (IOCs)
+- TLS connections (SNI, versions)
+- Suspicious payload patterns
+- HTTP objects with SHA256 hashes
+- Protocol anomalies (expert info)
+
+## 4. Wireshark Verification Steps
+For each finding: display filter + step-by-step GUI procedure
+- Verify top talkers: `ip.addr == <IP>`
+- Verify TLS: `tls.handshake.type == 1`
+- Verify payloads: `frame contains "<pattern>"`
+- Export HTTP objects: `File > Export Objects > HTTP...`
+- General 10-step investigation workflow
+
+## 5. Traffic Timeline
+
+## 6. Remediation Steps
+```
+
 ## How It Helps LLMs
 WireMCP bridges the gap between raw network data and LLM comprehension by:
 - **Contextualizing Traffic**: Converts live packet captures into structured outputs (JSON, stats) that LLMs can parse and reason about.
@@ -73,6 +125,23 @@ Edit `mcp.json` in Cursor -> Settings -> MCP :
 ```
 
 **Location (macOS)**: `/Users/YOUR_USER/Library/Application Support/Claude/claude_desktop_config.json`
+
+## Example 2: Opencode
+
+Add to your `opencode.json` configuration (usually at `~/.config/opencode/opencode.json` or project root):
+
+```json
+{
+  "mcpServers": {
+    "wiremcp": {
+      "command": "node",
+      "args": ["/ABSOLUTE_PATH_TO/WireMCP/index.js"]
+    }
+  }
+}
+```
+
+Then restart opencode. The WireMCP tools will be available for PCAP analysis during your sessions.
 
 ## Other Clients
 

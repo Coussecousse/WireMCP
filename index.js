@@ -1344,6 +1344,495 @@ server.prompt(
   })
 );
 
+server.tool(
+  'generate_incident_report',
+  'Generate a comprehensive incident report from a PCAP file with executive summary, IOCs, timeline, Wireshark verification steps, and remediation recommendations',
+  {
+    pcapPath: z.string().describe('Path to the PCAP file to analyze'),
+    outputPath: z.string().optional().describe('Path to save the report (optional, prints to output if not provided)'),
+    focus: z.string().optional().describe('Optional display filter to focus analysis (e.g., "ip.addr==1.2.3.4")'),
+  },
+  async (args) => {
+    try {
+      const tsharkPath = await findTshark();
+      const { pcapPath, outputPath, focus } = args;
+      await fs.access(pcapPath);
+      const fname = path.basename(pcapPath);
+      const filterFlag = focus ? ` -Y "${focus}"` : '';
+      const filterDesc = focus ? ` (filtered: ${focus})` : '';
+
+      let report = '';
+      const dateStr = new Date().toISOString().split('T')[0];
+
+      // ── File info ──
+      const stat = await fs.stat(pcapPath);
+      const fileSizeMB = (stat.size / (1024 * 1024)).toFixed(1);
+
+      let packetCount = '?';
+      try {
+        const { stdout: cnt } = await execAsync(
+          `${tsharkPath} -r "${pcapPath}"${filterFlag} -T fields -e frame.number`,
+          { maxBuffer: 10 * 1024 * 1024, env: { ...process.env, PATH: `${process.env.PATH}:/usr/bin:/usr/local/bin:/opt/homebrew/bin` } }
+        );
+        packetCount = cnt.trim().split('\n').filter(l => l.trim()).length.toString();
+      } catch {}
+
+      // ── Expert info (top errors/warnings) ──
+      let expertSummary = '';
+      let expertAnomalies = [];
+      try {
+        const { stdout: expert } = await execAsync(
+          `${tsharkPath} -r "${pcapPath}"${filterFlag} -T fields -e frame.number -e _ws.expert.message -e _ws.expert.severity -e _ws.expert.group`,
+          { maxBuffer: 50 * 1024 * 1024, env: { ...process.env, PATH: `${process.env.PATH}:/usr/bin:/usr/local/bin:/opt/homebrew/bin` } }
+        );
+        const sevMap = { '0': 'Chat', '1': 'Note', '2': 'Warning', '3': 'Error', Chat: 'Chat', Note: 'Note', Warning: 'Warning', Error: 'Error' };
+        const expertLines = expert.trim().split('\n').filter(l => l.trim() && l.includes('\t') && !l.includes('tshark:'));
+        const severityCounts = { Error: 0, Warning: 0, Note: 0, Chat: 0 };
+        const uniqueMessages = {};
+        for (const line of expertLines) {
+          const parts = line.split('\t');
+          const rawSev = (parts[2] || '').trim();
+          const sev = sevMap[rawSev] || 'Note';
+          const msg = (parts[1] || '').trim();
+          if (sev === 'Error' || sev === 3) severityCounts.Error++;
+          else if (sev === 'Warning' || sev === 2) severityCounts.Warning++;
+          else if (sev === 'Note' || sev === 1) severityCounts.Note++;
+          else severityCounts.Chat++;
+          if (msg && !uniqueMessages[msg]) uniqueMessages[msg] = { severity: sev === 3 ? 'Error' : sev === 2 ? 'Warning' : 'Note', count: 1 };
+          else if (msg && uniqueMessages[msg]) uniqueMessages[msg].count++;
+        }
+        expertSummary = `Errors: ${severityCounts.Error}, Warnings: ${severityCounts.Warning}, Notes: ${severityCounts.Note}`;
+        expertAnomalies = Object.entries(uniqueMessages)
+          .sort((a, b) => b[1].count - a[1].count)
+          .slice(0, 10)
+          .map(([msg, info]) => ({ msg, severity: info.severity, count: info.count }));
+      } catch {}
+
+      // ── Endpoint stats (top talkers) ──
+      let topTalkers = [];
+      let totalIPs = 0;
+      try {
+        const { stdout: ips } = await execAsync(
+          `${tsharkPath} -r "${pcapPath}"${filterFlag} -T fields -e ip.src -e ip.dst -e _ws.col.Protocol`,
+          { maxBuffer: 50 * 1024 * 1024, env: { ...process.env, PATH: `${process.env.PATH}:/usr/bin:/usr/local/bin:/opt/homebrew/bin` } }
+        );
+        const ipLines = ips.trim().split('\n').filter(l => l.trim());
+        const ipStats = {};
+        for (const line of ipLines) {
+          const [src, dst, proto] = line.split('\t');
+          if (src && !ipStats[src]) ipStats[src] = { asSrc: 0, asDst: 0, protocols: new Set() };
+          if (dst && !ipStats[dst]) ipStats[dst] = { asSrc: 0, asDst: 0, protocols: new Set() };
+          if (src) { ipStats[src].asSrc++; if (proto) ipStats[src].protocols.add(proto); }
+          if (dst) { ipStats[dst].asDst++; if (proto) ipStats[dst].protocols.add(proto); }
+        }
+        const sorted = Object.entries(ipStats).sort((a, b) => (b[1].asSrc + b[1].asDst) - (a[1].asSrc + a[1].asDst));
+        totalIPs = sorted.length;
+        topTalkers = sorted.slice(0, 10).map(([ip, st]) => ({ ip, total: st.asSrc + st.asDst, src: st.asSrc, dst: st.asDst, protos: [...st.protocols].slice(0, 5).join(', ').replace(/\n/g, ', ') }));
+      } catch {}
+
+      // ── Timeline summary ──
+      let timelineSummary = '';
+      let timelineEvents = [];
+      try {
+        const { stdout: tl } = await execAsync(
+          `${tsharkPath} -r "${pcapPath}"${filterFlag} -T fields -e frame.number -e frame.time_relative -e ip.src -e ip.dst -e _ws.col.Protocol`,
+          { maxBuffer: 50 * 1024 * 1024, env: { ...process.env, PATH: `${process.env.PATH}:/usr/bin:/usr/local/bin:/opt/homebrew/bin` } }
+        );
+        const tlLines = tl.trim().split('\n').filter(l => l.trim());
+        if (tlLines.length > 0) {
+          const first = tlLines[0].split('\t');
+          const last = tlLines[tlLines.length - 1].split('\t');
+          const duration = last[1] && first[1] ? (parseFloat(last[1]) - parseFloat(first[1])).toFixed(1) : '?';
+          timelineSummary = `${tlLines.length} packets over ${duration}s`;
+          // Key time-based events (sample at intervals)
+          const interval = Math.max(1, Math.floor(tlLines.length / 10));
+          for (let i = 0; i < tlLines.length; i += interval) {
+            const parts = tlLines[i].split('\t');
+            if (parts[1]) timelineEvents.push({ time: parts[1], count: 1 });
+          }
+        }
+      } catch {}
+
+      // ── TLS metadata (suspicious SNIs) ──
+      let tlsConnections = [];
+      let suspiciousSNIs = [];
+      try {
+        const { stdout: tlsJson } = await execAsync(
+          `${tsharkPath} -r "${pcapPath}"${filterFlag} -Y "tls.handshake.type == 1" -T json -e frame.number -e ip.src -e ip.dst -e tcp.srcport -e tcp.dstport -e tls.handshake.extensions_server_name -e tls.handshake.version`,
+          { maxBuffer: 50 * 1024 * 1024, env: { ...process.env, PATH: `${process.env.PATH}:/usr/bin:/usr/local/bin:/opt/homebrew/bin` } }
+        );
+        let packets;
+        try { packets = JSON.parse(tlsJson); } catch {}
+        if (packets && packets.length > 0) {
+          const connMap = {};
+          for (const p of packets) {
+            const layers = p._source?.layers;
+            if (!layers) continue;
+            const srcIp = layers['ip.src']?.[0];
+            const dstIp = layers['ip.dst']?.[0];
+            const srcPort = layers['tcp.srcport']?.[0];
+            const dstPort = layers['tcp.dstport']?.[0];
+            if (!srcIp || !dstIp) continue;
+            const src = `${srcIp}:${srcPort || '?'}`;
+            const dst = `${dstIp}:${dstPort || '?'}`;
+            const sni = layers['tls.handshake.extensions_server_name']?.[0];
+            const ver = layers['tls.handshake.version']?.[0];
+            const key = `${srcIp}→${dstIp}`;
+            if (!connMap[key]) connMap[key] = { src, dst, sni: new Set(), versions: new Set(), frames: [] };
+            connMap[key].frames.push(layers['frame.number']?.[0]);
+            if (sni) connMap[key].sni.add(sni);
+            if (ver) connMap[key].versions.add(ver);
+          }
+          tlsConnections = Object.entries(connMap).map(([key, c]) => ({
+            dst: c.dst,
+            sni: [...c.sni].join(', '),
+            version: [...c.versions].join(', '),
+            frames: c.frames.length > 0 ? `${c.frames[0]}–${c.frames[c.frames.length - 1]}` : '?',
+            frameCount: c.frames.length,
+          }));
+
+          const suspiciousKeywords = ['\.xyz', '\.top', '\.club', '\.download', '\.work', '\.gq', '\.ml', '\.cf', 'tk', 'ddns', 'duckdns', 'no-ip', 'servehttp', 'serveftp', 'dynamic-dns', 'redirectme'];
+          for (const c of tlsConnections) {
+            if (c.sni) {
+              const lower = c.sni.toLowerCase();
+              const isSuspicious = suspiciousKeywords.some(k => lower.includes(k.replace(/^\\\./, '.')));
+              const isIP = /^\d+\.\d+\.\d+\.\d+$/.test(c.sni);
+              if (isSuspicious || isIP) suspiciousSNIs.push(c);
+            }
+          }
+        }
+      } catch {}
+
+      // ── HTTP objects ──
+      let httpObjects = [];
+      try {
+        const tmpDir = `http_objects_${Date.now()}`;
+        await fs.mkdir(tmpDir, { recursive: true });
+        await execAsync(
+          `${tsharkPath} -r "${pcapPath}"${filterFlag} --export-objects "http,${tmpDir}"`,
+          { maxBuffer: 50 * 1024 * 1024, env: { ...process.env, PATH: `${process.env.PATH}:/usr/bin:/usr/local/bin:/opt/homebrew/bin` } }
+        );
+        const files = await fs.readdir(tmpDir).catch(() => []);
+        for (const file of files) {
+          const fpath = path.join(tmpDir, file);
+          try {
+            const fstat = await fs.stat(fpath);
+            const hash = crypto.createHash('sha256').update(await fs.readFile(fpath)).digest('hex');
+            httpObjects.push({ name: file, size: fstat.size, sha256: hash });
+          } catch {}
+        }
+        // Cleanup
+        for (const file of files) {
+          try { await fs.unlink(path.join(tmpDir, file)); } catch {}
+        }
+        try { await fs.rmdir(tmpDir); } catch {}
+      } catch {}
+
+      // ── Search for common C2 patterns ──
+      let searchResults = {};
+      const commonPatterns = [
+        { pattern: 'eval', filter: 'http', label: 'HTTP eval()' },
+        { pattern: 'base64_decode', filter: 'http', label: 'base64_decode' },
+        { pattern: 'cmd', filter: 'http', label: 'HTTP cmd' },
+        { pattern: 'exec', filter: 'http', label: 'HTTP exec' },
+        { pattern: 'shell', filter: 'http', label: 'HTTP shell' },
+        { pattern: 'passwd', filter: '', label: 'passwd in payload' },
+        { pattern: 'admin', filter: 'http', label: 'HTTP admin' },
+      ];
+      for (const { pattern, filter: f, label } of commonPatterns) {
+        try {
+          const filterPrefix = f ? `${f} and ` : '';
+          const hexP = Buffer.from(pattern, 'utf8').toString('hex').replace(/(..)/g, '$1:').replace(/:$/, '');
+          const { stdout } = await execAsync(
+            `${tsharkPath} -r "${pcapPath}" -Y "${filterPrefix}frame contains ${hexP}" -T fields -e frame.number`,
+            { maxBuffer: 10 * 1024 * 1024, env: { ...process.env, PATH: `${process.env.PATH}:/usr/bin:/usr/local/bin:/opt/homebrew/bin` } }
+          );
+          const count = stdout.trim().split('\n').filter(l => l.trim()).length;
+          if (count > 0) searchResults[label] = count;
+        } catch {}
+      }
+
+      // ── Try common TCP streams ──
+      let interestingStreams = [];
+      for (let sid = 0; sid <= 20; sid++) {
+        try {
+          const { stdout: stream } = await execAsync(
+            `${tsharkPath} -r "${pcapPath}"${filterFlag} -z follow,tcp,ascii,${sid}`,
+            { maxBuffer: 10 * 1024 * 1024, env: { ...process.env, PATH: `${process.env.PATH}:/usr/bin:/usr/local/bin:/opt/homebrew/bin` } }
+          );
+          const clean = stream.trim();
+          // Extract data bytes (skip header/footer metadata lines)
+          const dataLines = clean.split('\n').filter(l => {
+            const t = l.trim();
+            return t && !t.startsWith('=') && !t.startsWith('Follow:') && !t.startsWith('Filter:') && !t.startsWith('Node') && t.length > 10;
+          });
+          const dataContent = dataLines.join('\n').slice(0, 500);
+          // Only keep streams with actual application data
+          const hasRealData = dataContent.length > 50 && !dataContent.includes('DHCP') && !/^\d+\s+\d+\.\d+\s+/.test(dataContent);
+          if (hasRealData) interestingStreams.push({ stream: sid, size: clean.length, preview: dataContent.slice(0, 500) });
+        } catch {}
+      }
+
+      // ═══════════════════════════════════════════
+      // BUILD THE REPORT
+      // ═══════════════════════════════════════════
+
+      report += `# Incident Report — ${fname}\n\n`;
+      report += `**Generated:** ${dateStr}  \n`;
+      report += `**PCAP:** \`${fname}\` (${fileSizeMB} MB, ${packetCount} packets)${filterDesc}  \n`;
+      report += `**Tool:** WireMCP via MCP protocol\n\n`;
+
+      // ── Section 1: Executive Summary ──
+      report += `## 1. Executive Summary\n\n`;
+      if (expertSummary) report += `**Traffic Overview:** ${expertSummary}. ${totalIPs} unique IPs identified. ${timelineSummary}.\n\n`;
+      if (suspiciousSNIs.length > 0) {
+        report += `**Suspicious TLS Connections Detected:** ${suspiciousSNIs.length} connections to potentially suspicious destinations were identified.\n\n`;
+      }
+      if (Object.keys(searchResults).length > 0) {
+        report += `**Pattern Matches Found:** Suspicious strings matched in packet payloads.\n\n`;
+      }
+      if (httpObjects.length > 0) {
+        report += `**HTTP Objects Extracted:** ${httpObjects.length} file(s) transferred over HTTP.\n\n`;
+      }
+      if (interestingStreams.length > 0) {
+        report += `**TCP Streams of Interest:** ${interestingStreams.length} stream(s) with significant data content.\n\n`;
+      }
+
+      // ── Section 2: Network Topology & Key Hosts ──
+      report += `## 2. Network Topology & Key Hosts\n\n`;
+      if (topTalkers.length > 0) {
+        report += `**Top Talkers (by packet volume):**\n\n`;
+        report += `| IP | Src Pkts | Dst Pkts | Total | Protocols |\n`;
+        report += `|----|----------|----------|-------|-----------|\n`;
+        for (const t of topTalkers) {
+          report += `| \`${t.ip}\` | ${t.src} | ${t.dst} | ${t.total} | ${t.protos} |\n`;
+        }
+        report += `\nTotal unique IPs: ${totalIPs}\n\n`;
+      } else {
+        report += `No IP traffic data available.\n\n`;
+      }
+
+      // ── Section 3: IOCs ──
+      report += `## 3. Indicators of Compromise (IOCs)\n\n`;
+
+      if (suspiciousSNIs.length > 0) {
+        report += `### Suspicious TLS Connections\n\n`;
+        report += `| Destination | SNI | TLS Version | Frames |\n`;
+        report += `|-------------|-----|-------------|--------|\n`;
+        for (const c of suspiciousSNIs) {
+          report += `| \`${c.dst}\` | ${c.sni} | ${c.version} | ${c.frames} |\n`;
+        }
+        report += '\n';
+      }
+
+      if (tlsConnections.length > 0 && suspiciousSNIs.length === 0) {
+        report += `### TLS Connections Overview\n\n`;
+        report += `| Destination | SNI | TLS Version |\n`;
+        report += `|-------------|-----|-------------|\n`;
+        for (const c of tlsConnections.slice(0, 15)) {
+          report += `| \`${c.dst}\` | ${c.sni || '(none)'} | ${c.version || '(unknown)'} |\n`;
+        }
+        if (tlsConnections.length > 15) report += `| ... and ${tlsConnections.length - 15} more | | |\n`;
+        report += '\n';
+      }
+
+      if (Object.keys(searchResults).length > 0) {
+        report += `### Suspicious Payload Patterns\n\n`;
+        report += `| Pattern | Matches |\n`;
+        report += `|---------|---------|\n`;
+        for (const [label, count] of Object.entries(searchResults)) {
+          report += `| ${label} | ${count} |\n`;
+        }
+        report += '\n';
+      }
+
+      if (httpObjects.length > 0) {
+        report += `### HTTP Objects Transferred\n\n`;
+        report += `| File | Size | SHA256 |\n`;
+        report += `|------|------|--------|\n`;
+        const hashGroups = {};
+        for (const obj of httpObjects) {
+          const key = obj.sha256;
+          if (!hashGroups[key]) hashGroups[key] = { size: obj.size, sha256: obj.sha256, names: [], count: 0 };
+          hashGroups[key].names.push(obj.name);
+          hashGroups[key].count++;
+        }
+        for (const [, group] of Object.entries(hashGroups)) {
+          const nameDisplay = group.count > 1 ? `${group.names[0]} (+${group.count - 1} more)` : group.names[0];
+          report += `| ${nameDisplay} | ${group.size} bytes | \`${group.sha256}\` |\n`;
+        }
+        report += '\n';
+      }
+
+      if (interestingStreams.length > 0) {
+        report += `### Interesting TCP Streams\n\n`;
+        for (const s of interestingStreams) {
+          report += `**Stream ${s.stream}** (${s.size} bytes):\n\`\`\`\n${s.preview}\n\`\`\`\n\n`;
+        }
+      }
+
+      if (expertAnomalies.length > 0) {
+        report += `### Protocol Anomalies (Expert Info)\n\n`;
+        report += `| Severity | Message | Occurrences |\n`;
+        report += `|----------|---------|-------------|\n`;
+        for (const a of expertAnomalies) {
+          const icon = a.severity === 'Error' ? '🔴' : a.severity === 'Warning' ? '🟡' : '🔵';
+          report += `| ${icon} ${a.severity} | ${a.msg.replace(/\|/g, '\\|')} | ${a.count} |\n`;
+        }
+        report += '\n';
+      }
+
+      // ── Section 4: Wireshark Verification Steps ──
+      report += `## 4. Wireshark Verification Steps\n\n`;
+      report += `The following display filters and procedures can be used in **Wireshark GUI** to verify each finding:\n\n`;
+
+      // Verification for top talkers
+      if (topTalkers.length > 0) {
+        const topIP = topTalkers[0].ip;
+        report += `### 4.1 Verify Top Talkers\n\n`;
+        report += `**Display filter:**\n\`\`\`\nip.addr == ${topIP}\n\`\`\`\n`;
+        report += `**Procedure:** Apply this filter in Wireshark to isolate all traffic to/from the most active host. Use \`Statistics > Endpoints\` to see all communicating hosts.\n\n`;
+
+        if (topTalkers.length > 1) {
+          report += `**To see traffic between top 2 hosts:**\n\`\`\`\nip.addr == ${topTalkers[0].ip} && ip.addr == ${topTalkers[1].ip}\n\`\`\`\n\n`;
+        }
+      }
+
+      // Verification for TLS
+      if (tlsConnections.length > 0) {
+        report += `### 4.2 Verify TLS Connections\n\n`;
+        report += `**To view all TLS handshakes:**\n\`\`\`\ntls.handshake.type == 1\n\`\`\`\n`;
+        report += `**To see TLS Client Hellos (with SNI):**\n\`\`\`\ntls.handshake.type == 1 && tls.handshake.extensions_server_name\n\`\`\`\n`;
+
+        if (suspiciousSNIs.length > 0) {
+          report += `**To filter specific suspicious SNI:**\n\`\`\`\ntls.handshake.extensions_server_name == "${suspiciousSNIs[0].sni}"\n\`\`\`\n`;
+        }
+
+        report += `**Procedure:** Right-click a TLS packet → \`Follow > TLS Stream\` to decrypt the session (if keys are available). Use \`Statistics > TLS\` for aggregate TLS analysis.\n\n`;
+      }
+
+      // Verification for suspicious patterns
+      if (Object.keys(searchResults).length > 0) {
+        report += `### 4.3 Verify Suspicious Payload Patterns\n\n`;
+        for (const [label, count] of Object.entries(searchResults).slice(0, 3)) {
+          const pattern = label.includes('(') ? label.split('(')[1]?.split(')')[0] || label : label;
+          report += `**Pattern: \`${label}\`** (${count} matches)\n`;
+          report += `**Display filter:**\n\`\`\`\nframe contains "${pattern}"\n\`\`\`\n`;
+          report += `**Procedure:** Apply this filter, then right-click a matching packet → \`Follow > TCP Stream\` to see the full conversation context.\n\n`;
+        }
+      }
+
+      // Verification for HTTP objects
+      if (httpObjects.length > 0) {
+        report += `### 4.4 Verify HTTP Objects\n\n`;
+        report += `**To see all HTTP requests:**\n\`\`\`\nhttp.request\n\`\`\`\n`;
+        report += `**To export objects in Wireshark GUI:** \`File > Export Objects > HTTP...\` — this lists all HTTP objects transferred with MD5 hashes and sizes.\n\n`;
+        report += `**For binary content analysis:** Right-click the object → \`Export Packet Bytes\` → save and analyze with external tools (VirusTotal, pestudio, etc.)\n\n`;
+      }
+
+      // Verification for expert info
+      if (expertAnomalies.length > 0) {
+        report += `### 4.5 Verify Protocol Anomalies\n\n`;
+        report += `**Open Expert Info dialog:** \`Analyze > Expert Info\` (or \`Analyze > Expert Info Composite\`).\n\n`;
+        report += `**To filter error severity in the packet list:** Use \`Analyze > Display Filter\` with:\n\`\`\`\n_ws.expert.severity >= 2\n\`\`\`\n*(severity 2=Warning, 3=Error)*\n`;
+        report += `*Note: Expert info errors are shown as red circles (Error), yellow diamonds (Warning), cyan squares (Note) in Wireshark's packet list.*\n\n`;
+      }
+
+      // General Wireshark investigation workflow
+      report += `### 4.6 General Wireshark Investigation Workflow\n\n`;
+      report += `1. **Initial triage:** \`Statistics > Protocol Hierarchy\` — identify unusual protocols\n`;
+      report += `2. **Find top talkers:** \`Statistics > Endpoints\` (IPv4 tab) — sort by packets\n`;
+      report += `3. **Timeline analysis:** \`Statistics > I/O Graph\` — set 1s interval, look for periodic bursts (beaconing)\n`;
+      report += `4. **DNS investigation:** \`dns.flags.response == 0\` — look for suspicious domains\n`;
+      report += `5. **HTTP analysis:** \`http.request\` — review URIs, User-Agents, POST data\n`;
+      report += `6. **TLS inspection:** \`tls.handshake.type == 1\` — identify SNIs and JA3 fingerprints\n`;
+      report += `7. **Stream reassembly:** Right-click any packet → \`Follow > TCP/UDP/TLS Stream\`\n`;
+      report += `8. **Export objects:** \`File > Export Objects > HTTP/SMB/IMF...\` — extract transferred files\n`;
+      report += `9. **Coloring rules:** \`View > Coloring Rules\` — apply custom rules to highlight C2 traffic, DNS anomalies, etc.\n`;
+      report += `10. **Extract IOCs:** Use \`tshark\` CLI for automated extraction (pipe to grep/cut/jq)\n\n`;
+
+      // ── Section 5: Timeline ──
+      report += `## 5. Traffic Timeline\n\n`;
+      if (timelineSummary) {
+        report += `**Duration:** ${timelineSummary}\n\n`;
+        report += `| Time (relative) | Event Count |\n`;
+        report += `|----------------|-------------|\n`;
+        for (const ev of timelineEvents.slice(0, 15)) {
+          report += `| +${ev.time}s | ${ev.count} packets |\n`;
+        }
+        if (timelineEvents.length > 15) report += `| ... and ${timelineEvents.length - 15} more intervals | |\n`;
+        report += '\n';
+      } else {
+        report += `No timeline data available.\n\n`;
+      }
+
+      // ── Section 6: Remediation Steps ──
+      report += `## 6. Remediation Steps\n\n`;
+      report += `Based on the analysis of this PCAP, the following remediation steps are recommended:\n\n`;
+
+      if (suspiciousSNIs.length > 0 || Object.keys(searchResults).length > 0) {
+        report += `1. **Isolate affected hosts** — Immediately quarantine any hosts communicating with suspicious destinations.\n`;
+        report += `2. **Block malicious IPs** — Add identified C2 IPs to firewall blocklist.\n`;
+        report += `3. **DNS sinkhole** — Add suspicious domains to DNS blocklist/sinkhole.\n`;
+        if (suspiciousSNIs.length > 0) {
+          report += `4. **Inspect TLS traffic** — If decryption keys are available, decrypt TLS streams to examine encrypted payloads.\n`;
+        }
+        if (httpObjects.length > 0) {
+          report += `5. **Analyze extracted objects** — Submit extracted HTTP objects to VirusTotal or sandbox for malware analysis.\n`;
+        }
+        report += `6. **Credentials reset** — Reset passwords for any users observed in the traffic.\n`;
+        report += `7. **Full host scan** — Perform EDR/AV scan on affected hosts, check for persistence mechanisms.\n`;
+        report += `8. **Retain evidence** — Preserve the PCAP and any extracted artifacts for forensic analysis and threat intelligence sharing.\n`;
+      } else {
+        report += `1. **No clear compromise indicators** — This traffic appears benign. Continue routine monitoring.\n`;
+        report += `2. **Baseline establishment** — Document normal traffic patterns for future comparison.\n`;
+        report += `3. **Periodic review** — Re-run this tool on a regular basis to establish a baseline of normal behavior.\n`;
+      }
+      report += '\n';
+
+      // ── Footer ──
+      report += `---\n*Report generated by WireMCP — Wireshark MCP Server*\n`;
+
+      // ── Save or return ──
+      if (outputPath) {
+        await fs.writeFile(outputPath, report, 'utf8');
+        return {
+          content: [{ type: 'text', text: `Report saved to: ${outputPath}\n\nSummary: ${packetCount} packets, ${totalIPs} IPs, ${tlsConnections.length} TLS connections, ${httpObjects.length} HTTP objects, ${Object.keys(searchResults).length} pattern matches.` }],
+        };
+      }
+
+      return {
+        content: [{ type: 'text', text: report }],
+      };
+    } catch (error) {
+      console.error(`Error in generate_incident_report: ${error.message}`);
+      return { content: [{ type: 'text', text: `Error: ${error.message}` }], isError: true };
+    }
+  }
+);
+
+server.prompt(
+  'generate_incident_report_prompt',
+  {
+    pcapPath: z.string().describe('Path to the PCAP file'),
+  },
+  ({ pcapPath }) => ({
+    messages: [{
+      role: 'user',
+      content: {
+        type: 'text',
+        text: `Please generate a comprehensive incident report for ${pcapPath}. Include:
+1. Executive summary with key findings
+2. Top talkers and network topology analysis
+3. All indicators of compromise (IOCs) extracted from TLS, HTTP, and payload analysis
+4. Wireshark verification steps for each finding
+5. Traffic timeline
+6. Remediation recommendations`
+      }
+    }]
+  })
+);
+
 module.exports = {
   findTshark, trimPackets, parseTsharkJson,
   parseIcmpPayloadsFromHex, extractRawIcmpPayloads
