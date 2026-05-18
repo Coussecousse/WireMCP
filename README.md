@@ -132,14 +132,21 @@ Add to your `opencode.json` configuration (usually at `~/.config/opencode/openco
 
 ```json
 {
-  "mcpServers": {
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
     "wiremcp": {
-      "command": "node",
-      "args": ["/ABSOLUTE_PATH_TO/WireMCP/index.js"]
+      "type": "local",
+      "command": [
+        "node",
+        "/ABSOLUTE_PATH_TO/WireMCP/index.js"
+      ],
+      "enabled": true
     }
   }
 }
 ```
+
+> **Note**: Replace `/ABSOLUTE_PATH_TO/WireMCP/index.js` with the actual absolute path on your system (e.g., `/home/kali/Documents/pentests/WireMCP/index.js`).
 
 Then restart opencode. The WireMCP tools will be available for PCAP analysis during your sessions.
 
